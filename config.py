@@ -4,12 +4,12 @@
 BASE_URL = "https://mangabuff.ru"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
 
-USE_COOKIES_AUTH = False  # True = использовать cookies, False = логин/пароль
+USE_COOKIES_AUTH = True  # True = использовать cookies, False = логин/пароль
 
 # Cookies для авторизации (получите из браузера или после первого логина)
 AUTH_COOKIES = {
-     "mangabuff_session=eyJpdiI6IktGNGJWaHM4Y0w3MG9FTkZyUlh6d1E9PSIsInZhbHVlIjoicHYxZ3Z5S21mblMzSi9DVjdUbDdObkhMN2Z0d0JBNjJzcWpMVnZQR09Ic0g0T0JJQXAzQ0JpMmhLdE5ZalEzRE1yclhRZUsrSVR4V1ZtUkNlbWNRdW5xVGxjQmFPYUdOckRaVFRrYWdaNEJXR0taSWFzNmYyMnJ1c2wwNE9odzEiLCJtYWMiOiJjYmEyZWY0OGY3ZmRhOGUxODE3MDhhY2RhZWU1MjEwOWU0ZTljZWYwNzY1ODFmYzE3NmI2MGYzNGRjOTE4NWUyIiwidGFnIjoiIn0%3D; expires=Tue, 03-Feb-2026 01:59:25 GMT; Max-Age=21600; path=/; httponly; samesite=lax"
-}
+       "mangabuff_session": "eyJpdiI6IktGNGJWaHM4Y0w3MG9FTkZyUlh6d1E9PSIsInZhbHVlIjoicHYxZ3Z5S21mblMzSi9DVjdUbDdObkhMN2Z0d0JBNjJzcWpMVnZQR09Ic0g0T0JJQXAzQ0JpMmhLdE5ZalEzRE1yclhRZUsrSVR4V1ZtUkNlbWNRdW5xVGxjQmFPYUdOckRaVFRrYWdaNEJXR0taSWFzNmYyMnJ1c2wwNE9odzEiLCJtYWMiOiJjYmEyZWY0OGY3ZmRhOGUxODE3MDhhY2RhZWU1MjEwOWU0ZTljZWYwNzY1ODFmYzE3NmI2MGYzNGRjOTE4NWUyIiwidGFnIjoiIn0%3D"
+   }
 
 AUTH_CSRF_TOKEN = "VHzpa480fmLuumbw972xTqwOfnp1pSuPR5y3kUw4"
 

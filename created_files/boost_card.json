@@ -1,0 +1,22 @@
+{
+  "name": "Луис Регритина",
+  "id": 401155538,
+  "card_id": 101113,
+  "rank": "C",
+  "wanters_count": 0,
+  "owners_count": 1278,
+  "card_url": "https://mangabuff.ru/cards/101113/users",
+  "timestamp": 1770065012.332635,
+  "needs_replacement": false,
+  "club_members": [
+    {
+      "user_id": "46873",
+      "username": "User46873"
+    },
+    {
+      "user_id": "10082",
+      "username": "User10082"
+    }
+  ],
+  "image_url": "https://mangabuff.ru/img/cards/g25ktgChW4ir2TFhhV49r83tCXYzRn.png"
+}
