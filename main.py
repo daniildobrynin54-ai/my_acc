@@ -1,0 +1,664 @@
+import argparse
+import sys
+import time
+import os
+from typing import Optional
+
+from config import (
+    OUTPUT_DIR,
+    BOOST_CARD_FILE,
+    WAIT_AFTER_ALL_OWNERS,
+    WAIT_CHECK_INTERVAL,
+    WAIT_MODE_CHECK_INTERVAL,
+    WAIT_MODE_STATS_INTERVAL,
+    HISTORY_CHECK_INTERVAL,
+    USE_COOKIES_AUTH,
+    AUTH_COOKIES,
+    AUTH_CSRF_TOKEN
+)
+from auth import (
+    login, 
+    create_session_from_cookies,
+    print_cookies_for_config
+)
+from inventory import get_user_inventory, InventoryManager
+from boost import get_boost_card_info
+from card_selector import select_trade_card
+from owners_parser import process_owners_page_by_page, OwnersProcessor
+from monitor import start_boost_monitor
+from trade import (
+    send_trade_to_owner,
+    cancel_all_sent_trades,
+    TradeHistoryMonitor
+)
+from card_replacement import check_and_replace_if_needed, force_replace_card
+from daily_stats import create_stats_manager
+from proxy_manager import create_proxy_manager
+from rate_limiter import get_rate_limiter
+from utils import (
+    ensure_dir_exists,
+    save_json,
+    load_json,
+    format_card_info,
+    print_section,
+    print_success,
+    print_error,
+    print_warning,
+    print_info
+)
+
+class MangaBuffApp:
+    """Главное приложение MangaBuff v2.8 - поддержка авторизации через cookies."""
+    
+    MAX_FAILED_CYCLES = 3
+    
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.session = None
+        self.monitor = None
+        self.history_monitor = None
+        self.output_dir = OUTPUT_DIR
+        self.inventory_manager = InventoryManager(self.output_dir)
+        self.stats_manager = None
+        self.processor = None
+        self.proxy_manager = None
+        self.rate_limiter = get_rate_limiter()
+        self.replace_requested = False
+        self.failed_cycles_count = 0
+    
+    def setup(self) -> bool:
+        ensure_dir_exists(self.output_dir)
+        
+        self.proxy_manager = create_proxy_manager(
+            proxy_url=self.args.proxy,
+            proxy_file=self.args.proxy_file,
+            auto_update_ip=True
+        )
+        
+        print(f"⏱️  Rate Limiting: {self.rate_limiter.max_requests} req/min")
+        
+        # 🔧 НОВОЕ: Выбор метода авторизации
+        print("\n🔐 Вход в аккаунт...")
+        
+        # Приоритет 1: Параметры командной строки
+        if self.args.email and self.args.password:
+            print("   Метод: Логин/Пароль (из аргументов)")
+            self.session = login(
+                self.args.email,
+                self.args.password,
+                self.proxy_manager
+            )
+            
+            # Опционально: сохраняем cookies для будущего использования
+            if self.session and self.args.save_cookies:
+                print_cookies_for_config(self.session)
+        
+        # Приоритет 2: Cookies из конфига
+        elif USE_COOKIES_AUTH and AUTH_COOKIES:
+            print("   Метод: Cookies (из config.py)")
+            self.session = create_session_from_cookies(
+                AUTH_COOKIES,
+                AUTH_CSRF_TOKEN or None,
+                self.proxy_manager
+            )
+        
+        # Приоритет 3: Cookies из аргументов
+        elif self.args.cookies:
+            print("   Метод: Cookies (из аргументов)")
+            cookies_dict = self._parse_cookies_string(self.args.cookies)
+            if cookies_dict:
+                self.session = create_session_from_cookies(
+                    cookies_dict,
+                    self.args.csrf_token or None,
+                    self.proxy_manager
+                )
+            else:
+                print_error("Не удалось распарсить cookies")
+                return False
+        
+        # Ошибка: не указан ни один метод
+        else:
+            print_error("Не указан способ авторизации!")
+            print("Используйте:")
+            print("  1. --email и --password")
+            print("  2. --cookies и опционально --csrf-token")
+            print("  3. Установите USE_COOKIES_AUTH=True в config.py")
+            return False
+        
+        if not self.session:
+            print_error("Ошибка авторизации")
+            return False
+        
+        print_success("Авторизация успешна\n")
+        return True
+    
+    def _parse_cookies_string(self, cookies_str: str) -> Optional[dict]:
+        """
+        🔧 НОВОЕ: Парсит строку с cookies в словарь.
+        
+        Поддерживаемые форматы:
+        - name1=value1; name2=value2
+        - name1=value1,name2=value2
+        - JSON: {"name1": "value1", "name2": "value2"}
+        """
+        try:
+            # Пробуем JSON
+            import json
+            return json.loads(cookies_str)
+        except:
+            pass
+        
+        cookies_dict = {}
+        
+        # Пробуем разделители ; или ,
+        for separator in [';', ',']:
+            if separator in cookies_str:
+                for pair in cookies_str.split(separator):
+                    pair = pair.strip()
+                    if '=' in pair:
+                        name, value = pair.split('=', 1)
+                        cookies_dict[name.strip()] = value.strip()
+                break
+        
+        # Одна пара name=value
+        if not cookies_dict and '=' in cookies_str:
+            name, value = cookies_str.split('=', 1)
+            cookies_dict[name.strip()] = value.strip()
+        
+        return cookies_dict if cookies_dict else None
+    
+    def init_stats_manager(self) -> bool:
+        if not self.args.boost_url:
+            print_warning("URL буста не указан")
+            return False
+        
+        print("📊 Инициализация менеджера статистики...")
+        self.stats_manager = create_stats_manager(
+            self.session,
+            self.args.boost_url
+        )
+        self.stats_manager.print_stats(force_refresh=True)
+        return True
+    
+    def init_history_monitor(self) -> bool:
+        print("📊 Инициализация монитора истории обменов...")
+        
+        self.history_monitor = TradeHistoryMonitor(
+            session=self.session,
+            user_id=int(self.args.user_id),
+            inventory_manager=self.inventory_manager,
+            debug=self.args.debug
+        )
+        
+        self.history_monitor.start(check_interval=HISTORY_CHECK_INTERVAL)
+        
+        print_success(f"Монитор истории запущен (проверка каждые {HISTORY_CHECK_INTERVAL}с)\n")
+        return True
+    
+    def init_processor(self) -> None:
+        if not self.processor:
+            self.processor = OwnersProcessor(
+                session=self.session,
+                select_card_func=select_trade_card,
+                send_trade_func=send_trade_to_owner,
+                dry_run=self.args.dry_run,
+                debug=self.args.debug
+            )
+    
+    def load_inventory(self) -> Optional[list]:
+        if self.args.skip_inventory:
+            return []
+        
+        print(f"📦 Загрузка инвентаря пользователя {self.args.user_id}...")
+        inventory = get_user_inventory(self.session, self.args.user_id)
+        
+        print_success(f"Всего загружено: {len(inventory)} карточек")
+        
+        if self.inventory_manager.save_inventory(inventory):
+            print(f"💾 Инвентарь сохранен")
+        
+        print(f"\n🔄 Синхронизация инвентаря с пропарсенными данными...")
+        if self.inventory_manager.sync_inventories():
+            print_success("Синхронизация завершена\n")
+        else:
+            print_warning("Ошибка синхронизации инвентаря\n")
+        
+        return inventory
+    
+    def load_boost_card(self) -> Optional[dict]:
+        if not self.args.boost_url:
+            return None
+        
+        boost_card = get_boost_card_info(self.session, self.args.boost_url)
+        
+        if not boost_card:
+            print_error("Не удалось получить карту для буста")
+            return None
+        
+        print_success("Карточка для вклада:")
+        print(f"   {format_card_info(boost_card)}")
+        
+        if boost_card.get('needs_replacement', False):
+            print_warning(f"\n⚠️  Карта требует замены!")
+            
+            new_card = check_and_replace_if_needed(
+                self.session,
+                self.args.boost_url,
+                boost_card,
+                self.stats_manager
+            )
+            
+            if new_card:
+                boost_card = new_card
+        
+        save_json(f"{self.output_dir}/{BOOST_CARD_FILE}", boost_card)
+        print(f"💾 Карточка сохранена\n")
+        
+        return boost_card
+    
+    def start_monitoring(self, boost_card: dict):
+        if not self.args.enable_monitor:
+            return
+        
+        self.monitor = start_boost_monitor(
+            self.session,
+            self.args.boost_url,
+            self.stats_manager,
+            self.output_dir
+        )
+        
+        self.monitor.current_card_id = boost_card['card_id']
+    
+    def wait_for_boost_or_timeout(
+        self,
+        card_id: int,
+        timeout: int = WAIT_AFTER_ALL_OWNERS
+    ) -> bool:
+        if not self.monitor:
+            return False
+        
+        print_section(
+            f"⏳ ВСЕ ВЛАДЕЛЬЦЫ ОБРАБОТАНЫ - Ожидание {timeout // 60} мин",
+            char="="
+        )
+        print(f"   Текущая карта: ID {card_id}")
+        print(f"   Мониторинг продолжает работать...\n")
+        
+        start_time = time.time()
+        check_count = 0
+        
+        while time.time() - start_time < timeout:
+            check_count += 1
+            
+            if self.monitor.card_changed:
+                elapsed = int(time.time() - start_time)
+                print(f"\n✅ БУСТ ПРОИЗОШЕЛ через {elapsed}с!")
+                return True
+            
+            if check_count % 15 == 0:
+                elapsed = int(time.time() - start_time)
+                remaining = timeout - elapsed
+                print(f"⏳ Ожидание: {elapsed}с / {remaining}с осталось")
+            
+            time.sleep(WAIT_CHECK_INTERVAL)
+        
+        print(f"\n⏱️  ТАЙМАУТ: {timeout // 60} минут")
+        return False
+    
+    def enter_wait_mode(self, current_boost_card: dict) -> None:
+        """Режим ожидания при достижении лимита вкладов."""
+        # Отменяем все обмены ПЕРЕД входом в режим ожидания
+        if not self.args.dry_run and self.processor and self.processor.trade_manager:
+            print("\n🔄 Отменяем все обмены перед режимом ожидания...")
+            success = cancel_all_sent_trades(
+                self.session,
+                self.processor.trade_manager,
+                self.history_monitor,
+                self.args.debug
+            )
+            if success:
+                print_success("✅ Обмены отменены")
+            else:
+                print_warning("⚠️  Не удалось отменить обмены")
+        
+        print_section("⏸️  РЕЖИМ ОЖИДАНИЯ", char="=")
+        print("   ⛔ Достигнут лимит вкладов")
+        print("   🔄 Мониторинг карты: АКТИВЕН (легковесная проверка card_id)")
+        print(f"   📜 История обменов: проверка каждые {HISTORY_CHECK_INTERVAL}с")
+        print(f"   ⏰ Проверка сброса лимитов: каждые {WAIT_MODE_CHECK_INTERVAL}с")
+        print("   Нажмите Ctrl+C для завершения\n")
+        
+        self.stats_manager.print_stats(force_refresh=True)
+        
+        check_count = 0
+        last_stats_time = time.time()
+        
+        while True:
+            check_count += 1
+            
+            # Проверяем только можем ли вкладывать
+            if self.stats_manager.can_donate(force_refresh=True):
+                print_success("\n✅ Лимит вкладов обновился! Возобновляем работу...")
+                self.stats_manager.print_stats()
+                return
+            
+            # Вывод статистики раз в 5 минут
+            current_time = time.time()
+            if current_time - last_stats_time >= WAIT_MODE_STATS_INTERVAL:
+                print_section("📊 РЕЖИМ ОЖИДАНИЯ - Статистика", char="-")
+                self.stats_manager.print_stats()
+                last_stats_time = current_time
+            
+            # Проверка смены карты через монитор
+            if self.monitor and self.monitor.card_changed:
+                print_info("ℹ️  Карта в клубе изменилась (режим ожидания)")
+                self.monitor.card_changed = False
+                
+                # Обновляем текущую карту
+                current_boost_card = self._load_current_boost_card(current_boost_card)
+            
+            if check_count % 10 == 0:
+                print(f"⏳ Ожидание сброса лимитов... (проверка #{check_count})")
+            
+            time.sleep(WAIT_MODE_CHECK_INTERVAL)
+    
+    def attempt_auto_replacement(self, current_boost_card: dict, reason: str = "АВТОЗАМЕНА ПОСЛЕ 3 НЕУДАЧНЫХ ЦИКЛОВ") -> Optional[dict]:
+        if not self.stats_manager.can_replace(force_refresh=True):
+            print_warning("⛔ Лимит замен достигнут!")
+            self.stats_manager.print_stats()
+            return None
+        
+        new_card = force_replace_card(
+            self.session,
+            self.args.boost_url,
+            current_boost_card,
+            self.stats_manager,
+            reason=reason
+        )
+        
+        if new_card:
+            self.failed_cycles_count = 0
+            print_success("✅ Замена выполнена! Счетчик неудачных циклов сброшен\n")
+            return new_card
+        else:
+            print_warning("❌ Замена не удалась\n")
+            return None
+    
+    def run_processing_mode(self, boost_card: dict):
+        self.init_processor()
+        
+        while True:
+            # Проверяем лимит вкладов
+            if not self.stats_manager.can_donate(force_refresh=True):
+                print_warning("\n⛔ Лимит вкладов достигнут!")
+                current_boost_card = self._load_current_boost_card(boost_card)
+                self.enter_wait_mode(current_boost_card)
+                # После выхода из режима ожидания продолжаем
+                continue
+            
+            current_boost_card = self._load_current_boost_card(boost_card)
+            current_card_id = current_boost_card['card_id']
+            
+            if self.failed_cycles_count >= self.MAX_FAILED_CYCLES:
+                print_warning(f"\n⚠️  Достигнуто {self.MAX_FAILED_CYCLES} неудачных ПОЛНЫХ циклов!")
+                
+                new_card = self.attempt_auto_replacement(
+                    current_boost_card,
+                    reason="АВТОЗАМЕНА ПОСЛЕ 3 НЕУДАЧНЫХ ЦИКЛОВ"
+                )
+                
+                if new_card:
+                    current_boost_card = new_card
+                    current_card_id = new_card['card_id']
+                    
+                    if self.monitor:
+                        self.monitor.current_card_id = current_card_id
+                    
+                    self.processor.reset_state()
+                    continue
+                else:
+                    self.failed_cycles_count = 0
+                    print_info("ℹ️  Продолжаем работу с текущей картой")
+            
+            if current_boost_card.get('needs_replacement', False):
+                if not self.stats_manager.can_replace(force_refresh=True):
+                    print_warning(f"\n⚠️  Карта требует замены, но лимит замен исчерпан!")
+                    self.stats_manager.print_stats()
+                else:
+                    print_warning(f"\n⚠️  Карта требует автозамены!")
+                    
+                    new_card = check_and_replace_if_needed(
+                        self.session,
+                        self.args.boost_url,
+                        current_boost_card,
+                        self.stats_manager
+                    )
+                    
+                    if new_card:
+                        current_boost_card = new_card
+                        current_card_id = new_card['card_id']
+                        
+                        if self.monitor:
+                            self.monitor.current_card_id = current_card_id
+                        
+                        self.processor.reset_state()
+                        self.failed_cycles_count = 0
+            
+            if self.monitor:
+                self.monitor.card_changed = False
+            
+            print(f"\n🎯 Обработка: {current_boost_card['name']} (ID: {current_card_id})")
+            
+            current_rate = self.rate_limiter.get_current_rate()
+            print(f"📊 Текущий rate: {current_rate}/{self.rate_limiter.max_requests} req/min\n")
+            
+            # Еще раз проверяем лимит перед обработкой
+            if not self.stats_manager.can_donate(force_refresh=True):
+                print_warning("⛔ Лимит вкладов достигнут!")
+                self.enter_wait_mode(current_boost_card)
+                continue
+            
+            boost_happened_this_cycle = False
+            
+            total = process_owners_page_by_page(
+                session=self.session,
+                card_id=str(current_card_id),
+                boost_card=current_boost_card,
+                output_dir=self.output_dir,
+                select_card_func=select_trade_card,
+                send_trade_func=send_trade_to_owner,
+                monitor_obj=self.monitor,
+                processor=self.processor,
+                dry_run=self.args.dry_run,
+                debug=self.args.debug
+            )
+            
+            if total > 0:
+                print_success(f"Обработано {total} владельцев")
+                
+                if self.processor.trade_manager:
+                    sent_count = len(self.processor.trade_manager.sent_trades)
+                    print_success(f"✅ Отправлено обменов: {sent_count}")
+            else:
+                print_warning("Нет доступных владельцев")
+            
+            if self._should_restart():
+                boost_happened_this_cycle = True
+                self.processor.reset_state()
+                self.failed_cycles_count = 0
+                print_success("✅ Буст произошел - счетчик неудачных циклов сброшен")
+                self._prepare_restart()
+                time.sleep(1)
+                continue
+            
+            if self.monitor and self.monitor.is_running() and total > 0:
+                boost_occurred = self.wait_for_boost_or_timeout(current_card_id)
+                
+                if boost_occurred:
+                    boost_happened_this_cycle = True
+                    self.processor.reset_state()
+                    self.failed_cycles_count = 0
+                    print_success("✅ Буст произошел - счетчик неудачных циклов сброшен")
+                    self._prepare_restart()
+                    time.sleep(1)
+                    continue
+                else:
+                    print("🔄 Отменяем обмены...")
+                    if not self.args.dry_run:
+                        success = cancel_all_sent_trades(
+                            self.session,
+                            self.processor.trade_manager,
+                            self.history_monitor,
+                            self.args.debug
+                        )
+                        if success:
+                            print_success("Обмены отменены, история проверена!")
+                        else:
+                            print_warning("Не удалось отменить")
+                    
+                    if not boost_happened_this_cycle:
+                        self.failed_cycles_count += 1
+                        print_warning(
+                            f"⚠️  ПОЛНЫЙ цикл #{self.failed_cycles_count}/{self.MAX_FAILED_CYCLES} "
+                            f"завершен БЕЗ вклада (таймаут ожидания)"
+                        )
+                    
+                    print_section("🔄 ПЕРЕЗАПУСК с той же картой", char="=")
+                    time.sleep(1)
+                    continue
+            
+            if total == 0:
+                self.failed_cycles_count += 1
+                print_warning(
+                    f"⚠️  ПОЛНЫЙ цикл #{self.failed_cycles_count}/{self.MAX_FAILED_CYCLES} "
+                    f"завершен БЕЗ вклада (нет владельцев)"
+                )
+                print_section("🔄 ПЕРЕЗАПУСК с той же картой", char="=")
+                time.sleep(1)
+                continue
+            
+            break
+    
+    def _load_current_boost_card(self, default: dict) -> dict:
+        path = f"{self.output_dir}/{BOOST_CARD_FILE}"
+        current = load_json(path, default=default)
+        return current if current else default
+    
+    def _should_restart(self) -> bool:
+        return (
+            self.monitor and
+            self.monitor.is_running() and
+            self.monitor.card_changed
+        )
+    
+    def _prepare_restart(self):
+        print_section("🔄 ПЕРЕЗАПУСК с новой картой", char="=")
+    
+    def wait_for_monitor(self):
+        if not self.monitor or not self.monitor.is_running():
+            return
+        
+        try:
+            print_section("Мониторинг активен. Ctrl+C для выхода", char="=")
+            
+            while self.monitor.is_running():
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            print("\n\n⚠️  Прерывание...")
+            self.monitor.stop()
+            if self.history_monitor:
+                self.history_monitor.stop()
+    
+    def run(self) -> int:
+        if not self.setup():
+            return 1
+        
+        if self.args.boost_url:
+            if not self.init_stats_manager():
+                print_warning("Работа без статистики")
+        
+        if not self.args.skip_inventory:
+            self.init_history_monitor()
+        
+        inventory = self.load_inventory()
+        boost_card = self.load_boost_card()
+        
+        if not boost_card:
+            return 0
+        
+        self.start_monitoring(boost_card)
+        
+        if not self.args.only_list_owners:
+            self.run_processing_mode(boost_card)
+        
+        self.wait_for_monitor()
+        
+        if self.history_monitor:
+            self.history_monitor.stop()
+        
+        return 0
+
+def create_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="MangaBuff v2.8 - Авторизация через cookies"
+    )
+    
+    # 🔧 ОБНОВЛЕНО: Email и password теперь опциональны
+    parser.add_argument("--email", help="Email (для авторизации через логин/пароль)")
+    parser.add_argument("--password", help="Пароль (для авторизации через логин/пароль)")
+    
+    # 🔧 НОВОЕ: Авторизация через cookies
+    parser.add_argument("--cookies", help='Cookies в формате "name1=value1;name2=value2" или JSON')
+    parser.add_argument("--csrf-token", help="CSRF токен (опционально)")
+    parser.add_argument("--save-cookies", action="store_true", help="Сохранить cookies после логина")
+    
+    parser.add_argument("--user_id", required=True, help="ID пользователя")
+    parser.add_argument("--boost_url", help="URL буста")
+    
+    parser.add_argument("--proxy", help="URL прокси")
+    parser.add_argument("--proxy_file", help="Файл с прокси")
+    
+    parser.add_argument("--skip_inventory", action="store_true", help="Пропустить инвентарь")
+    parser.add_argument("--only_list_owners", action="store_true", help="Только список владельцев")
+    parser.add_argument("--enable_monitor", action="store_true", help="Включить мониторинг")
+    parser.add_argument("--dry_run", action="store_true", help="Тестовый режим")
+    parser.add_argument("--debug", action="store_true", help="Отладка")
+    
+    return parser
+
+def main():
+    print("=" * 70)
+    print("MangaBuff v2.8 - Starting...")
+    print("=" * 70)
+    print()
+    
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    
+    if args.debug:
+        print("🔧 DEBUG MODE ENABLED")
+    
+    if not args.proxy and not args.proxy_file:
+        args.proxy = os.getenv('PROXY_URL')
+    
+    app = MangaBuffApp(args)
+    
+    try:
+        exit_code = app.run()
+        if exit_code == 0:
+            print("\n✅ Программа завершена успешно")
+        else:
+            print("\n❌ Программа завершена с ошибками")
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Прервано пользователем")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
